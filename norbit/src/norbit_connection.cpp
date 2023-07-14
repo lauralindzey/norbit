@@ -5,8 +5,9 @@ bool NorbitConnection::shutdown_ = false;
 NorbitConnection::NorbitConnection() : privateNode_("~"), loop_rate(200.0) {
   updateParams();
 
-  ROS_INFO("Connecting to norbit MBES at ip  : %s", params_.ip.c_str());
-  ROS_INFO("  listening for bathy on port    : %i", params_.bathy_port);
+  ROS_INFO("Connecting to norbit MBES at ip     : %s", params_.ip.c_str());
+  ROS_INFO("  listening for bathy on port       : %i", params_.bathy_port);
+  ROS_INFO("  listening for watercolumn on port : %i", params_.water_column_port);
 
   setupPubSub();
 
@@ -123,12 +124,12 @@ bool NorbitConnection::openConnections() {
     sockets_.bathymetric->connect(boost::asio::ip::tcp::endpoint(
         boost::asio::ip::address::from_string(params_.ip), params_.bathy_port));
 
-    if(params_.pubWC()){
-    sockets_.water_column = std::unique_ptr<boost::asio::ip::tcp::socket>(
-        new boost::asio::ip::tcp::socket(io_service_));
+    if(params_.pubWC()) {
+      sockets_.water_column = std::unique_ptr<boost::asio::ip::tcp::socket>(
+          new boost::asio::ip::tcp::socket(io_service_));
 
-    sockets_.water_column->connect(boost::asio::ip::tcp::endpoint(
-        boost::asio::ip::address::from_string(params_.ip), params_.water_column_port));
+      sockets_.water_column->connect(boost::asio::ip::tcp::endpoint(
+          boost::asio::ip::address::from_string(params_.ip), params_.water_column_port));
     }
     sockets_.cmd = std::unique_ptr<boost::asio::ip::tcp::socket>(
         new boost::asio::ip::tcp::socket(io_service_));
@@ -214,8 +215,8 @@ norbit_msgs::CmdResp NorbitConnection::sendCmd(const std::string &cmd,
     } else {
       auto dt = ros::WallTime::now().toSec() - start_time.toSec();
       if (dt > params_.cmd_timeout) {
-        ROS_ERROR("[%s] TIMEOUT -- no ACK received",
-                  ros::this_node::getName().c_str());
+        ROS_ERROR("[%s] TIMEOUT -- no ACK received. dt = %0.3f since start = %0.3f",
+                  ros::this_node::getName().c_str(), dt, start_time.toSec());
         out.ack = false;
         running = false;
       }
@@ -245,6 +246,7 @@ void NorbitConnection::receiveCmd(const boost::system::error_code &err) {
 }
 
 void NorbitConnection::receiveWC() {
+  ROS_INFO("receiveWC() called");
   hdr_buff_.water_column.assign(0);
 
   sockets_.water_column->async_receive(
@@ -256,6 +258,7 @@ void NorbitConnection::receiveWC() {
 
 void NorbitConnection::wcHandler(const boost::system::error_code &error,
                                   std::size_t bytes_transferred) {
+  ROS_INFO("wcHandler() called");
   disconnect_timer_.setPeriod(ros::Duration(params_.disconnect_timeout), true);
   processHdrMsg(*sockets_.water_column,hdr_buff_.water_column);
   receiveWC();
@@ -263,6 +266,7 @@ void NorbitConnection::wcHandler(const boost::system::error_code &error,
 }
 
 void NorbitConnection::receiveBathy() {
+  ROS_INFO("receiveBathy() called");
   hdr_buff_.bathymetric.assign(0);
   sockets_.bathymetric->async_receive(
       boost::asio::buffer(hdr_buff_.bathymetric), 0,
@@ -273,21 +277,44 @@ void NorbitConnection::receiveBathy() {
 
 void NorbitConnection::bathyHandler(const boost::system::error_code &error,
                                   std::size_t bytes_transferred) {
+  ROS_INFO("bathyHandler() called");
   disconnect_timer_.setPeriod(ros::Duration(params_.disconnect_timeout), true);
-  ROS_INFO("Got bathy!");
   processHdrMsg(*sockets_.bathymetric,hdr_buff_.bathymetric);
   receiveBathy();
   return;
 }
 
-void NorbitConnection::processHdrMsg(boost::asio::ip::tcp::socket & sock, boost::array<char, sizeof(norbit_msgs::CommonHeader)> &hdr){
+void NorbitConnection::processHdrMsg(boost::asio::ip::tcp::socket & sock,
+    boost::array<char, sizeof(norbit_msgs::CommonHeader)> &hdr) {
+
+  std::stringstream ss;
+  ss << "Full header has " << sizeof(norbit_msgs::CommonHeader) << " bytes: \n";
+  int count = 0;
+  for (const auto& ch: hdr) {
+    // This is ugly, but using int(ch) alone gave a 64-bit int, rather than the 8-bit I wanted
+    // (And came with 6 leading f's`)
+    ss << std::hex << std::setw(2) << std::setfill('0')
+       << (int (ch) & 0xff) << ' ';
+    if (count % 8 == 7) {
+      // ss << '   '; // This renders as 202020
+    }
+    if (count % 16 == 15) {
+      ss << std::endl;
+    }
+    count += 1;
+  }
+
+  ROS_INFO(ss.str().c_str());
   try {
     norbit_types::Message msg;
     if (msg.fromBoostArray(hdr)) {
       const unsigned int dataSize = msg.commonHeader().size - sizeof(norbit_msgs::CommonHeader);
       std::shared_ptr<char> dataPtr;
       dataPtr.reset(new char[dataSize]);
-      size_t bytesRead =read(sock,boost::asio::buffer(dataPtr.get(), dataSize));
+      // TODO(lindzey): This read needs a timeout. Sometimes the Norbit just
+      //   stops sending watercolumn data, which blocks the entire program,
+      //   since all calls go through io_service_, which is single-thread.
+      size_t bytesRead = read(sock,boost::asio::buffer(dataPtr.get(), dataSize));
 
       if(msg.setBits(dataPtr)){
         if (msg.commonHeader().type == norbit_types::bathymetric) {
@@ -296,15 +323,26 @@ void NorbitConnection::processHdrMsg(boost::asio::ip::tcp::socket & sock, boost:
         if (msg.commonHeader().type == norbit_types::watercolum){
            wcCallback(msg.getWC());
         }
+      } else {
+        ROS_WARN("Norbit Message failed CRC check:  Ignoring");
       }
-      else ROS_WARN("Norbit Message failed CRC check:  Ignoring");
-
-    }else{
-      if(msg.commonHeader().version!=NORBIT_CURRENT_VERSION)
+    } else {
+      ROS_WARN_STREAM("Invalid header. " << std::hex << std::setfill('0')
+          << std::setw(8) << std::right
+          << " preamble = " << msg.commonHeader().preable
+          << ", type = " << msg.commonHeader().type
+          << ", size = " << msg.commonHeader().size
+          << ", version = " << msg.commonHeader().version);
+      if (msg.commonHeader().version != NORBIT_CURRENT_VERSION) {
         ROS_WARN("Invalid version detected expected %i, got %i",
                  NORBIT_CURRENT_VERSION, msg.commonHeader().version);
-      if(msg.commonHeader().preable==norbit_msgs::CommonHeader::NORBIT_PREAMBLE_KEY)
-        ROS_WARN("Invalid header preable detected");
+      }
+      if (msg.commonHeader().preable != norbit_msgs::CommonHeader::NORBIT_PREAMBLE_KEY) {
+        ROS_WARN_STREAM("Invalid header preable detected. Expected: 0x"
+            << std::hex << std::setfill('0') << std::setw(8) << std::right
+            << norbit_msgs::CommonHeader::NORBIT_PREAMBLE_KEY
+            << ", got: 0x" << msg.commonHeader().preable);
+      }
     }
 
   } catch (...) {
@@ -408,7 +446,7 @@ bool NorbitConnection::setPowerCallback(norbit_msgs::SetPower::Request &req,
 void NorbitConnection::spin_once() {
   io_service_.poll_one();
   ros::spinOnce();
-  loop_rate.sleep();
+  loop_rate.sleep();  // 200 Hz.
 }
 
 void NorbitConnection::spin() {
